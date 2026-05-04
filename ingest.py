@@ -32,6 +32,7 @@ from config import (
     VOYAGE_API_KEY,
     VOYAGE_MODEL,
 )
+from manifest import hash_file, load_manifest, save_manifest
 from models import CodeChunk
 from chunkers import TreeSitterChunker, FixedSizeChunker
 from chunkers.base import BaseChunker
@@ -130,7 +131,7 @@ def chunk_file(file_path: Path, repo_root: Path, repo_url: str) -> list[CodeChun
 _FREE_TIER_BATCH_SIZE = 8    # keeps each call well under 10K TPM
 _FREE_TIER_SLEEP_SEC = 21   # 3 RPM → wait 21s between calls
 
-
+# This creates embeddings in batches with retry logic and exponential backoff to handle rate limits gracefully.
 @retry(stop=stop_after_attempt(8), wait=wait_exponential(multiplier=2, min=30, max=120))
 def _embed_batch(voyage_client: voyageai.Client, texts: list[str]) -> list[list[float]]:
     result = voyage_client.embed(texts, model=VOYAGE_MODEL, input_type="document")
@@ -209,8 +210,60 @@ def ingest(repo_url: str, chroma_persist_dir: str = CHROMA_PERSIST_DIR) -> str:
 
     _, repo_dir = clone_or_pull(repo_url)
 
+    old_hashes = load_manifest(chroma_persist_dir, collection_name)
+
     all_files = list(walk_repo_files(repo_dir))
-    console.print(f"Found [bold]{len(all_files)}[/bold] files to index.")
+    current_rel_paths: dict[str, Path] = {
+        str(f.relative_to(repo_dir)): f for f in all_files
+    }
+
+    # Delete chunks for files removed from the repo
+    deleted_paths = set(old_hashes.keys()) - set(current_rel_paths.keys())
+    if deleted_paths:
+        collection = chroma_client.get_or_create_collection(
+            name=collection_name, metadata={"hnsw:space": "cosine"}
+        )
+        for rel_path in deleted_paths:
+            try:
+                collection.delete(where={"file_path": rel_path})
+            except Exception:
+                pass
+        console.print(f"Removed chunks for [bold]{len(deleted_paths)}[/bold] deleted file(s).")
+
+    # Hash all current files and identify which need re-indexing
+    new_hashes: dict[str, str] = {}
+    files_to_index: list[Path] = []
+    changed_existing: list[str] = []
+
+    for rel_path, abs_path in current_rel_paths.items():
+        file_hash = hash_file(abs_path)
+        new_hashes[rel_path] = file_hash
+        if old_hashes.get(rel_path) != file_hash:
+            files_to_index.append(abs_path)
+            if rel_path in old_hashes:
+                changed_existing.append(rel_path)
+
+    console.print(
+        f"Found [bold]{len(all_files)}[/bold] files; "
+        f"[bold]{len(files_to_index)}[/bold] new/changed."
+    )
+
+    if not files_to_index:
+        console.print("[green]Nothing changed — index is up to date.[/green]")
+        if deleted_paths:
+            save_manifest(chroma_persist_dir, collection_name, repo_url, new_hashes)
+        return collection_name
+
+    # Delete stale chunks for changed (not new) files before re-indexing
+    if changed_existing:
+        collection = chroma_client.get_or_create_collection(
+            name=collection_name, metadata={"hnsw:space": "cosine"}
+        )
+        for rel_path in changed_existing:
+            try:
+                collection.delete(where={"file_path": rel_path})
+            except Exception:
+                pass
 
     all_chunks: list[CodeChunk] = []
     with Progress(
@@ -220,8 +273,8 @@ def ingest(repo_url: str, chroma_persist_dir: str = CHROMA_PERSIST_DIR) -> str:
         TaskProgressColumn(),
         console=console,
     ) as progress:
-        chunk_task = progress.add_task("Chunking files...", total=len(all_files))
-        for file_path in all_files:
+        chunk_task = progress.add_task("Chunking files...", total=len(files_to_index))
+        for file_path in files_to_index:
             chunks = chunk_file(file_path, repo_dir, repo_url)
             all_chunks.extend(chunks)
             progress.advance(chunk_task)
@@ -243,6 +296,8 @@ def ingest(repo_url: str, chroma_persist_dir: str = CHROMA_PERSIST_DIR) -> str:
 
     console.print("Storing in ChromaDB...")
     store_in_chroma(embedded_chunks, chroma_client, collection_name)
+
+    save_manifest(chroma_persist_dir, collection_name, repo_url, new_hashes)
 
     collection = chroma_client.get_collection(collection_name)
     console.print(

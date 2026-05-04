@@ -242,6 +242,7 @@ def interactive_loop(graph, initial_state: BotState, config: dict) -> None:
 @click.option("--question", default=None, help="Ask a single question and exit")
 @click.option("--index-first", is_flag=True, help="(Re)index the repository before querying")
 @click.option("--interactive", is_flag=True, help="Start an interactive Q&A session")
+@click.option("--watch", is_flag=True, help="Watch repo dir and auto-reindex + error-check on save")
 @click.option("--commits", is_flag=True, help="Print full commit history and exit")
 @click.option("--limit", default=100, show_default=True, help="Max commits to fetch with --commits")
 @click.option("--chroma-dir", default=CHROMA_PERSIST_DIR, help="ChromaDB persist directory")
@@ -251,6 +252,7 @@ def main(
     question: Optional[str],
     index_first: bool,
     interactive: bool,
+    watch: bool,
     commits: bool,
     limit: int,
     chroma_dir: str,
@@ -304,6 +306,10 @@ def main(
                 "mcp_client": None,
             }
         }
+        if watch:
+            from watch import start_watcher
+            start_watcher(repo, voyage_client, chroma_client, graph, config, chroma_dir)
+            return
         _run(graph, config, repo, collection_name, question, interactive)
     else:
         with GitHubMCPClient(GITHUB_TOKEN) as mcp_client:
@@ -315,6 +321,10 @@ def main(
                     "mcp_client": mcp_client,
                 }
             }
+            if watch:
+                from watch import start_watcher
+                start_watcher(repo, voyage_client, chroma_client, graph, config, chroma_dir)
+                return
             _run(graph, config, repo, collection_name, question, interactive)
 
 

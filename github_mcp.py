@@ -204,6 +204,7 @@ def parse_codeowners(content: str) -> dict[str, str]:
         if not line or line.startswith("#"):
             continue
         parts = line.split()
+        
         if len(parts) >= 2:
             pattern = parts[0]
             owner = parts[1]  # first owner wins

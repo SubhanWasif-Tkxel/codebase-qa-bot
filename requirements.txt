@@ -16,3 +16,4 @@ rich>=13.7.0
 tiktoken>=0.7.0
 tenacity>=8.2.0
 python-dotenv>=1.0.0
+watchdog>=4.0.0
